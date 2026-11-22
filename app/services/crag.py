@@ -2,15 +2,13 @@ import json
 import os
 import re
 import datetime
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Any
 from app.services.llm_client import groq_client, call_openrouter, cohere_client
 
 GROQ_MODELS = [
-    "llama-3.3-70b-versatile",
-    "llama-3.1-8b-instant",
-    "deepseek-r1-distill-llama-70b",
-    "qwen-2.5-32b",
-    "mixtral-8x7b-32768"
+    "qwen/qwen3.8-27b",
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b"
 ]
 
 def _call_groq(messages: list, temperature: float = 0.0, response_format=None, max_tokens: int = 1000, preferred_model: Optional[str] = None) -> str:
@@ -48,6 +46,95 @@ def _format_markdown_response(text: str) -> str:
         return ""
     cleaned = re.sub(r'\n{3,}', '\n\n', text)
     return cleaned.strip()
+
+def classify_and_resolve_intent(query: str, history: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
+    """
+    Intelligently analyzes the student query in light of conversational history using Groq (<0.25s).
+    Determines intent (CONVERSATIONAL, CAMPUS_EVENTS, DOCUMENT_RAG, GENERAL_ACADEMIC),
+    resolves context references into a standalone query, and dynamically generates 
+    warm conversational responses when appropriate without hardcoded text.
+    """
+    default_result = {
+        "intent": "GENERAL_ACADEMIC",
+        "resolved_query": query,
+        "direct_response": None
+    }
+    if not query:
+        return default_result
+
+    clean_history = []
+    if history and isinstance(history, list):
+        for h in history[-6:]:
+            if isinstance(h, dict) and "role" in h and "content" in h:
+                clean_history.append({"role": h["role"], "content": str(h["content"])[:300]})
+
+    prompt = (
+        "You are an intelligent Conversational Router and Assistant for Dadi Institute of Engineering and Technology (DIET).\n"
+        "Analyze the student's latest query in light of the recent conversation history.\n\n"
+        "Classify INTENT into exactly one of:\n"
+        "1. 'CONVERSATIONAL': Greetings (hi, hello), gratitude (okay tq, thanks), acknowledgments (ok, cool, got it), pleasantries, bot identity, goodbyes, casual feedback, or general chit-chat.\n"
+        "2. 'CAMPUS_EVENTS': College events, workshops, fests, hackathons, seminars, dates, venues, schedules, or guest lectures.\n"
+        "3. 'DOCUMENT_RAG': Course materials, lecture notes, syllabus units, study guides, exam questions, or specific uploaded documents (e.g. 'DV UNIT - 3', 'devtodeploy', 'CS302 notes').\n"
+        "4. 'GENERAL_ACADEMIC': Conceptual academic or engineering questions, coding queries, explanations of concepts (e.g. 'what is normalization', 'explain merge sort in python').\n\n"
+        "If intent is 'CONVERSATIONAL':\n"
+        "Provide a 'direct_response':\n"
+        "- Generate a warm, friendly, natural, and helpful reply with 1-2 emojis (e.g. 😊, 👋, 🎓).\n"
+        "- If acknowledging earlier context (e.g., student says 'okay tq' or 'cool' after an event or study topic was discussed), reference that context naturally.\n"
+        "- Do NOT output academic lectures, textbook catalogs, or syllabus breakdowns!\n\n"
+        "If the query has follow-up references (e.g., 'where is it held?', 'who is the speaker?', 'can you explain that?'):\n"
+        "Provide a 'resolved_query': A standalone self-contained search query resolving pronouns and context. Otherwise, use the original query.\n\n"
+        "Output format MUST be valid JSON:\n"
+        "{\n"
+        '  "intent": "CONVERSATIONAL" | "CAMPUS_EVENTS" | "DOCUMENT_RAG" | "GENERAL_ACADEMIC",\n'
+        '  "resolved_query": "standalone search query",\n'
+        '  "direct_response": "friendly contextual reply if CONVERSATIONAL, otherwise null"\n'
+        "}"
+    )
+
+    history_str = json.dumps(clean_history) if clean_history else "[]"
+    user_msg = f"Conversation History: {history_str}\nLatest Query: {query}"
+
+    try:
+        if groq_client:
+            raw_json = _call_groq(
+                messages=[
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": user_msg}
+                ],
+                temperature=0.0,
+                response_format={"type": "json_object"},
+                max_tokens=300
+            )
+            parsed = json.loads(raw_json)
+            intent = parsed.get("intent", "GENERAL_ACADEMIC").upper()
+            resolved = parsed.get("resolved_query") or query
+            direct_ans = parsed.get("direct_response")
+            return {
+                "intent": intent,
+                "resolved_query": resolved,
+                "direct_response": direct_ans
+            }
+    except Exception as e:
+        print(f"LLM Intent router failed, using fallback: {e}")
+
+    # Fallback if Groq unavailable
+    q_low = query.lower().strip()
+    if any(q_low.startswith(w) for w in ["hi", "hello", "hey", "good morning", "good evening"]):
+        return {
+            "intent": "CONVERSATIONAL",
+            "resolved_query": query,
+            "direct_response": "Hello! 👋 How can I help you today? Feel free to ask about your syllabus, lecture notes, or campus events!"
+        }
+    if any(w in q_low for w in ["tq", "thanks", "thank you", "tysm"]):
+        return {
+            "intent": "CONVERSATIONAL",
+            "resolved_query": query,
+            "direct_response": "You're very welcome! 😊 Glad I could help. Let me know if you need any more assistance!"
+        }
+    if any(w in q_low for w in ["event", "fest", "workshop", "seminar", "upcoming"]):
+        return {"intent": "CAMPUS_EVENTS", "resolved_query": query, "direct_response": None}
+
+    return default_result
 
 def grade_chunks_batch(query: str, chunks: List[Dict]) -> List[Dict]:
     """
@@ -111,9 +198,14 @@ def rewrite_student_query(query: str) -> str:
         print(f"Query rewriting failed: {e}. Using original query.")
         return query
 
-async def generate_final_answer(query: str, relevant_chunks: List[Dict]) -> Tuple[str, List[str]]:
+async def generate_final_answer(
+    query: str, 
+    relevant_chunks: List[Dict],
+    history: Optional[List[Dict]] = None
+) -> Tuple[str, List[str]]:
     """
     Generates a grounded academic or event answer using OpenRouter / Cohere / Groq.
+    Incorporates recent conversation turns so follow-up inquiries are naturally answered.
     Formats clean citations without clutter.
     """
     if not relevant_chunks:
@@ -169,19 +261,26 @@ async def generate_final_answer(query: str, relevant_chunks: List[Dict]) -> Tupl
     current_date = datetime.datetime.now().strftime("%Y-%m-%d")
     user_prompt = f"Current Date: {current_date}\n\nAvailable Contexts:\n{context_text}\n\nStudent Query: {query}"
 
+    # Extract recent conversation turns for context continuity
+    conversation_msgs = []
+    if history and isinstance(history, list):
+        for h in history[-4:]:
+            if isinstance(h, dict) and "role" in h and "content" in h:
+                role = "assistant" if h["role"] == "assistant" else "user"
+                conversation_msgs.append({"role": role, "content": str(h["content"])[:350]})
+
+    full_messages = [{"role": "system", "content": system_prompt}] + conversation_msgs + [{"role": "user", "content": user_prompt}]
+
     # Dynamic SOTA Model Router Selection
     reasoning_keywords = ["solve", "derive", "math", "formula", "proof", "calculate", "algorithm", "code", "logic"]
     is_reasoning = any(k in query.lower() for k in reasoning_keywords)
-    preferred_model = "deepseek-r1-distill-llama-70b" if is_reasoning else "llama-3.3-70b-versatile"
+    preferred_model = "openai/gpt-oss-120b" if is_reasoning else "qwen/qwen3.8-27b"
 
     # 1. Try Groq (Ultra-fast 500+ TPS)
     if groq_client:
         try:
             answer = _call_groq(
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
+                messages=full_messages,
                 temperature=0.2,
                 max_tokens=1200,
                 preferred_model=preferred_model
@@ -192,11 +291,7 @@ async def generate_final_answer(query: str, relevant_chunks: List[Dict]) -> Tupl
 
     # 2. Try OpenRouter
     try:
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ]
-        answer = await call_openrouter(messages=messages, model="openai/gpt-4o-mini", temperature=0.2)
+        answer = await call_openrouter(messages=full_messages, model="openai/gpt-4o-mini", temperature=0.2)
         return _format_markdown_response(answer), citations
     except Exception as e:
         print(f"OpenRouter generation failed: {e}")
@@ -228,8 +323,8 @@ def format_doc_meta_line(doc: Dict) -> str:
         meta_parts.append(f"Type: {doc_type}")
 
     if meta_parts:
-        return f"• **{title}** ({', '.join(meta_parts)})"
-    return f"• **{title}**"
+        return f"- **{title}** ({', '.join(meta_parts)})"
+    return f"- **{title}**"
 
 async def summarize_document_chunks(doc_title: str, query: str, context_text: str) -> str:
     """Summarizes specific document chunks with robust multi-model fallback."""
@@ -277,17 +372,17 @@ async def generate_clarification_or_refusal(
     # Use LLM to generate an intelligent, comprehensive academic response for the query
     system_prompt = (
         "You are an expert academic tutor and student assistant at Dadi Institute of Engineering and Technology (DIET).\n"
-        "The student is asking an academic, course, syllabus, or campus question.\n"
-        "Provide a complete, well-structured, clear, and highly encouraging academic response.\n"
-        "For example, if asked about a syllabus (e.g. CS302 Database Systems), provide a complete 5-Unit Syllabus Breakdown (Unit 1: ER Data Modeling, Unit 2: Relational Algebra & SQL, Unit 3: Normalization 1NF-BCNF, Unit 4: Transaction Processing & ACID, Unit 5: Indexing & Storage).\n"
-        "Be professional, friendly, and structured with Markdown headers and bullet points.\n"
-        "Never say 'I could not find documents in the database'. Instead, answer the academic question directly and thoroughly first!"
+        "The student is asking a question: answer their specific question directly, concisely, and accurately.\n"
+        "If the student specifically requested a syllabus breakdown for a subject, provide a structured unit-by-unit syllabus breakdown for THAT specific subject.\n"
+        "If the question is an explanation of a concept, explain that specific concept clearly with examples.\n"
+        "Do NOT invent unrelated subjects or force a Database Systems syllabus unless that was specifically asked for.\n"
+        "Be professional, friendly, and structured with clean Markdown."
     )
 
     user_prompt = (
         f"Student Question: {query}\n\n"
         f"Available College Library Resources:\n{available_docs_str}\n\n"
-        "Please provide a complete academic explanation / syllabus breakdown for the student, and then politely mention the available library resources at the bottom."
+        "Please provide a complete academic explanation answering the student's question directly, and then politely mention the available library resources at the bottom if relevant."
     )
 
     messages = [

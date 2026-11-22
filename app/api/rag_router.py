@@ -1,9 +1,10 @@
 import os
+import re
 import json
 import tempfile
 import uuid
 import datetime
-from typing import Optional
+from typing import Optional, List, Dict, Any
 from fastapi import APIRouter, File, UploadFile, Form, HTTPException, status
 from pydantic import BaseModel
 from app.services.supabase_client import supabase_client
@@ -11,6 +12,7 @@ from app.services.parser import parse_pdf
 from app.services.embeddings import embedding_service
 from app.services.llm_client import call_openrouter
 from app.services.crag import (
+    classify_and_resolve_intent,
     grade_chunks_batch,
     rewrite_student_query, 
     generate_final_answer, 
@@ -22,6 +24,7 @@ router = APIRouter(prefix="/api/rag", tags=["RAG Ingestion & Search"])
 
 class SearchQuery(BaseModel):
     query: str
+    history: Optional[List[Dict[str, Any]]] = None
     course_id: Optional[str] = None
     doc_type: Optional[str] = None
     limit: Optional[int] = 5
@@ -310,27 +313,80 @@ def detect_unit_mismatch(query: str, doc_title: str) -> bool:
         return set(query_units).isdisjoint(set(doc_units))
     return False
 
-def is_greeting_query(query: str) -> bool:
+def get_conversational_response(query: str) -> Optional[str]:
     """
-    Checks if the user query is a simple greeting or general assistant query.
+    Identifies common conversational queries (greetings, thanks, acknowledgments, 
+    farewells, bot identity, and casual small talk) and returns an instant, warm,
+    user-friendly response. Returns None if query should be processed by RAG.
     """
-    clean_query = query.strip().lower().strip("?!. ")
+    if not query:
+        return None
+        
+    clean = query.strip().lower()
+    stripped = re.sub(r'[^\w\s]', '', clean).strip()
+    
+    # 1. Gratitude / Thanks (e.g. "tq", "okay tq", "ok thanks", "thanks a lot", "thank you so much", "tysm")
+    thanks_pat = r'^(?:(?:ok|okay|alright|yes|sure|cool|yeah)\s+)?(?:tq|ty|thanks|thank\s*you|thank\s*u|thanku|tysm|thx|much\s*appreciated|dhanyavadalu|danyavadalu)(?:\s+(?:so\s*much|a\s*lot|very\s*much|bro|bhai|sir|mam|madam|buddy|ai|assistant))?$'
+    if re.match(thanks_pat, stripped) or stripped in {'tq', 'ty', 'thanks', 'thank you', 'okay tq', 'ok tq', 'thx', 'tysm', 'thank u', 'thanku'}:
+        return "You're very welcome! 😊 Glad I could help. Let me know if you need any assistance with your courses, notes, syllabus, or campus events!"
+        
+    # 2. Greetings (e.g. "hi", "hello", "hey", "good morning", "namaste", "whats up")
     greetings = {
-        "hi", "hello", "hey", "hola", "greetings", "good morning", 
-        "good afternoon", "good evening", "howdy", "whats up", 
-        "what's up", "yo", "how are you", "who are you", "what can you do", "help"
+        "hi", "hello", "hey", "heyy", "hola", "greetings", "good morning", 
+        "good afternoon", "good evening", "gm", "namaste", "namaskaram", 
+        "vanakkam", "whats up", "what's up", "yo", "howdy"
     }
-    return clean_query in greetings or clean_query.startswith("hi ") or clean_query.startswith("hello ")
+    if stripped in greetings or any(stripped.startswith(g + " ") for g in ["hi", "hello", "hey", "good morning", "good afternoon", "good evening"]):
+        return "Hello! 👋 How can I help you today? You can ask me about your course syllabus, lecture notes, campus events, or exam preparation!"
+        
+    # 3. Acknowledgments / Agreements (e.g. "ok", "okay", "cool", "got it", "noted", "sure", "alright")
+    acks = {
+        "ok", "okay", "k", "kk", "cool", "got it", "noted", "sure", "alright", 
+        "fine", "understood", "great", "awesome", "super", "nice", "perfect", 
+        "done", "sare", "bagundi", "ok got it", "okay got it"
+    }
+    if stripped in acks or stripped.startswith("ok got it") or stripped.startswith("okay got it"):
+        return "Awesome! 👍 Feel free to ask anytime if you want to explore any subject topics, lecture notes, or upcoming campus events."
+        
+    # 4. Farewells / Goodbyes (e.g. "bye", "goodbye", "cya", "see you", "good night", "gn")
+    byes = {"bye", "goodbye", "cya", "see you", "see ya", "take care", "good night", "gn", "bye bye"}
+    if stripped in byes:
+        return "Goodbye! 👋 Have a wonderful day and all the best with your studies! Feel free to reach out whenever you need help."
+        
+    # 5. Bot Identity & Help
+    identity_pat = r'^(?:who|what)\s+(?:are\s+you|is\s+your\s+name|can\s+you\s+do)|how\s+can\s+you\s+help|help\s*me|help$'
+    if re.search(identity_pat, stripped):
+        return (
+            "I am the **DIET Campus AI Assistant** 🎓!\n\n"
+            "I'm here to support Dadi Institute of Engineering & Technology students and faculty with:\n\n"
+            "• **Course Notes & Study Materials**: Ask questions from your uploaded lecture notes.\n"
+            "• **Syllabus Inquiries**: Search topics, units, and subject outlines.\n"
+            "• **Campus Events**: Stay updated with upcoming fests, workshops, and dates.\n\n"
+            "How can I help you today?"
+        )
+
+    # 6. Casual Small Talk
+    if stripped in {"how are you", "how are u", "how r u", "how do you do", "hows it going", "how is it going"}:
+        return "I'm doing great, thank you for asking! 😊 Ready to help you with your subjects, syllabus, notes, or upcoming campus events. What would you like to explore today?"
+
+    if stripped in {"tell me a joke", "tell a joke", "make me laugh"}:
+        return "Why do programmers prefer dark mode? Because light attracts bugs! 🐛😄 Let me know if you need help with any study topics or college events!"
+
+    if stripped in {"who made you", "who created you", "who designed you"}:
+        return "I was developed for Dadi Institute of Engineering and Technology (DIET) to help students with academic queries, course notes, syllabus information, and campus events! 🎓"
+
+    return None
+
+def is_greeting_query(query: str) -> bool:
+    """Legacy helper for backward compatibility."""
+    return get_conversational_response(query) is not None
 
 @router.post("/query")
 async def query_assistant(payload: SearchQuery):
     """
-    Self-correcting RAG (CRAG) pipeline for student queries.
-    Intelligently routes and formats the response based on the 4 conversational Cases:
-    - Case 1: Unmatched Subject/Topic
-    - Case 2: General Subject/Topic Match (Dadi Institute source, no links)
-    - Case 3: Specific Document Request (Brief summary of doc content, Doc source, download link)
-    - Case 4: Specific Concept/Topic inside a document (Page-level citations, download link)
+    Self-correcting RAG (CRAG) pipeline with Context-Aware LLM Intent Routing.
+    Evaluates multi-turn conversation history to dynamically generate conversational responses,
+    resolve reference ambiguities, and route to event or document search.
     """
     if not supabase_client:
         raise HTTPException(
@@ -339,32 +395,24 @@ async def query_assistant(payload: SearchQuery):
         )
 
     try:
-        # Handle Case 5: Greetings / General Chit-chat
-        if is_greeting_query(payload.query):
-            system_prompt = (
-                "You are an intelligent, user-friendly academic assistant chatbot for Dadi Institute of Engineering and Technology (DIET).\n"
-                "The student sent a greeting or asked what you can do. Respond in a very friendly, professional, and welcoming manner.\n"
-                "Explain briefly that you can answer academic questions, explain course documents, or detail campus events.\n"
-                "State that they can query topics or specify documents (like 'DV UNIT - 3'). Do not include any citations or download links."
-            )
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": payload.query}
-            ]
-            answer = await call_openrouter(
-                messages=messages,
-                model="google/gemini-2.0-flash-001",
-                temperature=0.7
-            )
+        # 1. Intelligent LLM Context & Intent Router (< 0.25s)
+        # Evaluates the student query within the conversation history context
+        intent_info = classify_and_resolve_intent(payload.query, payload.history)
+        intent = intent_info.get("intent", "GENERAL_ACADEMIC")
+        effective_query = intent_info.get("resolved_query") or payload.query
+        direct_resp = intent_info.get("direct_response")
+
+        if intent == "CONVERSATIONAL" and direct_resp:
             return {
                 "query": payload.query,
-                "rewritten": False,
-                "rewritten_query": None,
-                "answer": answer,
+                "rewritten": effective_query != payload.query,
+                "rewritten_query": effective_query if effective_query != payload.query else None,
+                "answer": direct_resp,
                 "citations": ["[Dadi Institute of engineering and technology]"],
                 "document_links": {},
                 "chunks_used_count": 0
             }
+
         # Fetch all available documents to run classification
         available_docs = []
         try:
@@ -381,7 +429,7 @@ async def query_assistant(payload: SearchQuery):
         matched_doc = None
         matching_subject_docs = []
         
-        query_lower = payload.query.lower()
+        query_lower = effective_query.lower()
         import re
         query_clean = re.sub(r'[-\s]+', '', query_lower)
         # Normalize phonetic / numerical variations (e.g. dev2deploy -> devtodeploy)
@@ -428,7 +476,7 @@ async def query_assistant(payload: SearchQuery):
                 if matching_subject_docs:
                     intent_case = 2
 
-        print(f"CRAG Intent Classification: Case {intent_case} for query '{payload.query}'")
+        print(f"CRAG Intent Classification: Case {intent_case} for query '{effective_query}'")
 
         # Handle Case 3: Specific Document Request
         if intent_case == 3 and matched_doc:
@@ -448,7 +496,7 @@ async def query_assistant(payload: SearchQuery):
             context_blocks = [c.get("content") for c in doc_chunks if c.get("content")]
             context_text = "\n\n".join(context_blocks)
             
-            answer = await summarize_document_chunks(doc_title, payload.query, context_text)
+            answer = await summarize_document_chunks(doc_title, effective_query, context_text)
             
             document_links = {}
             if doc_url:
@@ -456,8 +504,8 @@ async def query_assistant(payload: SearchQuery):
                 
             return {
                 "query": payload.query,
-                "rewritten": False,
-                "rewritten_query": None,
+                "rewritten": effective_query != payload.query,
+                "rewritten_query": effective_query if effective_query != payload.query else None,
                 "answer": answer,
                 "citations": [f"[{doc_title}]"],
                 "document_links": document_links,
@@ -466,13 +514,13 @@ async def query_assistant(payload: SearchQuery):
 
         # Handle Case 2: General Subject Match
         if intent_case == 2 and matching_subject_docs:
-            answer = await generate_clarification_or_refusal(payload.query, matching_subject_docs, available_docs, case_type=2)
+            answer = await generate_clarification_or_refusal(effective_query, matching_subject_docs, available_docs, case_type=2)
             doc_links = {d["title"]: d["file_url"] for d in matching_subject_docs if d.get("file_url")}
             citations = [f"[{d['title']}]" for d in matching_subject_docs]
             return {
                 "query": payload.query,
-                "rewritten": False,
-                "rewritten_query": None,
+                "rewritten": effective_query != payload.query,
+                "rewritten_query": effective_query if effective_query != payload.query else None,
                 "answer": answer,
                 "citations": citations if citations else ["[Dadi Institute of engineering and technology]"],
                 "document_links": doc_links,
@@ -480,10 +528,10 @@ async def query_assistant(payload: SearchQuery):
             }
 
         # Handle Case 4: Specific Concept/Topic inside a document (Standard CRAG Pipeline)
-        query_vector = embedding_service.get_embedding(payload.query)
+        query_vector = embedding_service.get_embedding(effective_query)
         
         # Intercept event-related queries
-        is_event_query = any(word in query_lower for word in [
+        is_event_query = (intent == "CAMPUS_EVENTS") or any(word in query_lower for word in [
             "event", "fest", "seminar", "workshop", "announcement", 
             "conference", "schedule", "venue", "guest lecture", "upcoming"
         ])
@@ -592,11 +640,11 @@ async def query_assistant(payload: SearchQuery):
 
         # If still no relevant chunks, transition to Case 1 (completely unmatched subject)
         if not relevant_chunks:
-            answer = await generate_clarification_or_refusal(payload.query, available_docs, case_type=1)
+            answer = await generate_clarification_or_refusal(effective_query, available_docs, case_type=1)
             return {
                 "query": payload.query,
-                "rewritten": rewritten,
-                "rewritten_query": rewritten_query,
+                "rewritten": rewritten or (effective_query != payload.query),
+                "rewritten_query": effective_query if effective_query != payload.query else rewritten_query,
                 "answer": answer,
                 "citations": ["[Dadi Institute of engineering and technology]"],
                 "document_links": {},
@@ -619,15 +667,15 @@ async def query_assistant(payload: SearchQuery):
             except Exception as e:
                 print(f"Failed to fetch document public URLs: {e}")
 
-        answer, citations = await generate_final_answer(payload.query, relevant_chunks)
+        answer, citations = await generate_final_answer(effective_query, relevant_chunks, payload.history)
 
         # Intercept LLM refusal and convert to Case 1 fallback
         if "I could not find sufficient details in the uploaded files" in answer:
-            answer = await generate_clarification_or_refusal(payload.query, available_docs, case_type=1)
+            answer = await generate_clarification_or_refusal(effective_query, available_docs, case_type=1)
             return {
                 "query": payload.query,
-                "rewritten": rewritten,
-                "rewritten_query": rewritten_query,
+                "rewritten": rewritten or (effective_query != payload.query),
+                "rewritten_query": effective_query if effective_query != payload.query else rewritten_query,
                 "answer": answer,
                 "citations": ["[Dadi Institute of engineering and technology]"],
                 "document_links": {},
